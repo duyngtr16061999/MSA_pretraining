@@ -659,11 +659,9 @@ class VisualEncoder(nn.Module):
 
     def forward(self, visual_input):
         x = self.visual_fc(visual_input)
-        
         _, n, _ = visual_input.shape
         x = self.pos_embedding(x)
         x = self.visual_layer_norm(x)
-
         output = self.dropout(x)
         return output
 
@@ -746,6 +744,7 @@ class MMBERTEncoder(nn.Module):
         # self.cross_layers[0].visual_attention.att.value2 = nn.Linear(config.hidden_size, self.cross_layers[0].visual_attention.att.all_head_size)
         # self.cross_layers[0].audio_attention.att.key1 = nn.Linear(config.hidden_size, self.cross_layers[0].audio_attention.att.all_head_size)
         # self.cross_layers[0].audio_attention.att.value1 = nn.Linear(config.hidden_size, self.cross_layers[0].audio_attention.att.all_head_size)
+        self.type = next(self.parameters()).dtype
     
     def forward(self, input_ids,attention_mask,token_type_ids,
                 visn_feats, visn_attention_mask,
@@ -773,7 +772,8 @@ class MMBERTEncoder(nn.Module):
         lang_feats = self.language_project(lang_feats)
         
         extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-        extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype) # fp16 compatibility
+        #extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype) # fp16 compatibility
+        extended_attention_mask = extended_attention_mask.type(self.type)#.to(input_ids.device)
         extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
         
         for layer_module in self.cross_layers:
@@ -923,6 +923,8 @@ class MMBERTModel(nn.Module):
         self.config = config
         self.encoder = MMBERTEncoder(config)
         self.pooler = BertPooler(self.encoder.cross_config)
+        
+        self.type = next(self.parameters()).dtype
         self.apply(self.init_bert_weights)
     
     def init_bert_weights(self, module):
@@ -958,20 +960,23 @@ class MMBERTModel(nn.Module):
         # positions we want to attend and -10000.0 for masked positions.
         # Since we are adding it to the raw scores before the softmax, this is
         # effectively the same as removing these entirely.
-        extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype) # fp16 compatibility
+        #extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype) # fp16 compatibility
+        extended_attention_mask = extended_attention_mask.type(self.type)#.to(input_ids.device)
         extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
 
         # Process the visual attention mask
         if visn_attention_mask is not None:
             extended_visual_attention_mask = visn_attention_mask.unsqueeze(1).unsqueeze(2)
-            extended_visual_attention_mask = extended_visual_attention_mask.to(dtype=next(self.parameters()).dtype) # fp16 compatibility
+            #extended_visual_attention_mask = extended_visual_attention_mask.to(dtype=next(self.parameters()).dtype) # fp16 compatibility
+            extended_visual_attention_mask = extended_visual_attention_mask.type(self.type)#.to(input_ids.device)
             extended_visual_attention_mask = (1.0 - extended_visual_attention_mask) * -10000.0
         else:
             extended_visual_attention_mask = None
             
         if audio_attention_mask is not None:
             extended_audio_attention_mask = audio_attention_mask.unsqueeze(1).unsqueeze(2)
-            extended_audio_attention_mask = extended_audio_attention_mask.to(dtype=next(self.parameters()).dtype) # fp16 compatibility
+            #extended_audio_attention_mask = extended_audio_attention_mask.to(dtype=next(self.parameters()).dtype) # fp16 compatibility
+            extended_audio_attention_mask = extended_audio_attention_mask.type(self.type)#.to(input_ids.device)
             extended_audio_attention_mask = (1.0 - extended_audio_attention_mask) * -10000.0
         else:
             extended_audio_attention_mask = None
