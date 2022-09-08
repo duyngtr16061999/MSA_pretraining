@@ -34,6 +34,8 @@ from torch.nn import CrossEntropyLoss, SmoothL1Loss
 from transformers import BertModel, BertConfig
 from file_utils import cached_path
 
+import wandb
+
 logger = logging.getLogger(__name__)
 
 PRETRAINED_MODEL_ARCHIVE_MAP = {
@@ -150,8 +152,6 @@ class VisualAudioConfig(object):
 
         self.visual_feat_dim = 35
         self.audio_feat_dim = 74
-        self.max_visual_len = 500
-        self.max_audio_len = 500
 
         self.visual_hidden_dim = 288
         self.visual_num_attention_heads = 6
@@ -165,16 +165,14 @@ class VisualAudioConfig(object):
         self.cross_num_attention_heads = 6
         self.cross_intermediate_size = 576
 
-        # self.visual_losses = self.VISUAL_LOSSES
-        # self.visual_loss_config = {
-        #     'obj': (self.obj_id_num, 'ce', (-1,), 1/0.15),
-        #     'attr': (self.attr_id_num, 'ce', (-1,), 1/0.15),
-        #     'feat': (2048, 'l2', (-1, 2048), 1/0.15),
-        # }
-
-    def set_visual_dims(self, visual_feat_dim, audio_feat_dim):
+    def set_input_dim(self, visual_feat_dim, audio_feat_dim):
         self.visual_feat_dim = visual_feat_dim
         self.audio_feat_dim = audio_feat_dim
+
+    def set_layers(self, v_layers, a_layers, cross_layers):
+        self.v_layers = v_layers
+        self.a_layers = a_layers
+        self.cross_layers = cross_layers
 
     def set_visual_config(self, visual_hidden_dim, visual_num_attention_heads, visual_intermediate_size):
         self.visual_hidden_dim = visual_hidden_dim
@@ -186,6 +184,10 @@ class VisualAudioConfig(object):
         self.audio_num_attention_heads = audio_num_attention_heads
         self.audio_intermediate_size = audio_intermediate_size
 
+    def set_cross_config(self, cross_hidden_dim, cross_num_attention_heads, cross_intermediate_size):
+        self.cross_hidden_dim = cross_hidden_dim
+        self.cross_num_attention_heads = cross_num_attention_heads
+        self.cross_intermediate_size = cross_intermediate_size
 
 VisualConfig = VisualAudioConfig()
 
@@ -397,7 +399,7 @@ class BertBiAttention(nn.Module):
         new_context_layer_shape2 = context_layer2.size()[:-2] + (self.all_head_size,)
         context_layer2 = context_layer2.view(*new_context_layer_shape2)
 
-        context_layer_sum = context_layer1 + context_layer2
+        context_layer_sum = (context_layer1 + context_layer2)/2
         return context_layer_sum
 
 class BertAttention(nn.Module):
@@ -439,6 +441,7 @@ class BertAttention(nn.Module):
         attention_scores = attention_scores / math.sqrt(self.attention_head_size)
         # Apply the attention mask is (precomputed for all layers in BertModel forward() function)
         if attention_mask is not None:
+            #import pdb;pdb.set_trace()
             attention_scores = attention_scores + attention_mask
 
         # Normalize the attention scores to probabilities.
@@ -619,6 +622,27 @@ class MMBERTLayer(nn.Module):
 
         return lang_att_output, visn_att_output, audio_att_output
 
+class PositionalEncoding(nn.Module):
+
+    def __init__(self, d_model: int, dropout = 0.1, max_len: int = 5000):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, 1, d_model)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        """
+        Args:
+            x: Tensor, shape [seq_len, batch_size, embedding_dim]
+        """
+        x = x + self.pe[:x.size(0)]
+        return self.dropout(x)
+
 class VisualEncoder(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -627,7 +651,7 @@ class VisualEncoder(nn.Module):
         # Object feature encoding
         self.visual_fc = nn.Linear(feat_dim, VisualConfig.visual_hidden_dim)
         
-        self.pos_embedding = nn.Parameter(torch.randn(1, VisualConfig.max_visual_len + 1, VisualConfig.visual_hidden_dim))
+        self.pos_embedding = PositionalEncoding(VisualConfig.visual_hidden_dim)
         #self.cls_token = nn.Parameter(torch.randn(1, 1, config.hidden_size))
         
         self.visual_layer_norm = BertLayerNorm(VisualConfig.visual_hidden_dim, eps=1e-12)
@@ -637,7 +661,7 @@ class VisualEncoder(nn.Module):
         x = self.visual_fc(visual_input)
         
         _, n, _ = visual_input.shape
-        x += self.pos_embedding[:, :n]
+        x = self.pos_embedding(x)
         x = self.visual_layer_norm(x)
 
         output = self.dropout(x)
@@ -651,22 +675,22 @@ class AudioEncoder(nn.Module):
         # Object feature encoding
         self.audio_fc = nn.Linear(feat_dim, VisualConfig.audio_hidden_dim)
         
-        self.pos_embedding = nn.Parameter(torch.randn(1, VisualConfig.max_audio_len + 1, VisualConfig.audio_hidden_dim))
+        #self.pos_embedding = nn.Parameter(torch.randn(1, VisualConfig.max_audio_len + 1, VisualConfig.audio_hidden_dim))
+        self.pos_embedding = PositionalEncoding(VisualConfig.audio_hidden_dim)
         #self.cls_token = nn.Parameter(torch.randn(1, 1, config.hidden_size))
         
-        self.audio_layer_norm = BertLayerNorm(VisualConfig.audio_hidden_dim, eps=1e-12)
+        self.audio_layer_norm = BertLayerNorm(VisualConfig.audio_hidden_dim, eps=1e-5)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, audio_input):
         x = self.audio_fc(audio_input)
         
         _, n, _ = audio_input.shape
-        x += self.pos_embedding[:, :n]
+        x = self.pos_embedding(x)
         x = self.audio_layer_norm(x)
 
         output = self.dropout(x)
         return output
-
 
 class MMBERTEncoder(nn.Module):
     def __init__(self, config):
@@ -736,8 +760,8 @@ class MMBERTEncoder(nn.Module):
         bert_output = self.bertmodel(input_ids=input_ids,
                                 attention_mask=attention_mask,
                                 token_type_ids=token_type_ids)
-        lang_feats = bert_output[0]
-        
+
+        #lang_feats = bert_output[0]
         for layer_module in self.v_layers:
             visn_feats = layer_module(visn_feats, visn_attention_mask)
             
@@ -745,9 +769,15 @@ class MMBERTEncoder(nn.Module):
             audio_feats = layer_module(audio_feats, audio_attention_mask)
 
         # Run cross-modality layers
+        lang_feats = bert_output["last_hidden_state"]
         lang_feats = self.language_project(lang_feats)
+        
+        extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+        extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype) # fp16 compatibility
+        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+        
         for layer_module in self.cross_layers:
-            lang_feats, visn_feats, audio_feats = layer_module(lang_feats, attention_mask,
+            lang_feats, visn_feats, audio_feats = layer_module(lang_feats, extended_attention_mask,
                                                   visn_feats, visn_attention_mask,
                                                   audio_feats, audio_attention_mask)
 
@@ -828,14 +858,62 @@ class BertPreTrainingHeads(nn.Module):
     def forward(self, sequence_output, pooled_output):
         #prediction_scores = self.predictions(sequence_output)
         #hidden_states = self.transform(hidden_states)
-        hidden_states = self.dense(sequence_output)
+        if sequence_output is not None:
+            hidden_states = self.dense(sequence_output)
+            hidden_states = self.transform_act_fn(hidden_states)
+            hidden_states = self.LayerNorm(hidden_states)
+
+            prediction_scores = self.decoder(hidden_states) + self.bias
+        else:
+            prediction_scores = None
+
+        if pooled_output is not None:
+            seq_relationship_score = self.seq_relationship(pooled_output)
+        else:
+            seq_relationship_score = None
+
+        return prediction_scores, seq_relationship_score
+
+
+class BertVisualObjHead(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        if isinstance(config.hidden_act, str) or (sys.version_info[0] == 2 and isinstance(config.hidden_act, unicode)):
+            self.transform_act_fn = ACT2FN[config.hidden_act]
+        else:
+            self.transform_act_fn = config.hidden_act
+        self.LayerNorm = BertLayerNorm(config.hidden_size, eps=1e-12)
+
+        self.decoder = nn.Linear(config.hidden_size, VisualConfig.visual_feat_dim)
+
+
+    def forward(self, hidden_states):
+        hidden_states = self.dense(hidden_states)
         hidden_states = self.transform_act_fn(hidden_states)
         hidden_states = self.LayerNorm(hidden_states)
+        output_visual_feats = self.decoder(hidden_states)
+        return output_visual_feats
 
-        prediction_scores = self.decoder(hidden_states) + self.bias
+class BertAudioObjHead(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        if isinstance(config.hidden_act, str) or (sys.version_info[0] == 2 and isinstance(config.hidden_act, unicode)):
+            self.transform_act_fn = ACT2FN[config.hidden_act]
+        else:
+            self.transform_act_fn = config.hidden_act
+        self.LayerNorm = BertLayerNorm(config.hidden_size, eps=1e-12)
 
-        seq_relationship_score = self.seq_relationship(pooled_output)
-        return prediction_scores, seq_relationship_score
+        self.decoder = nn.Linear(config.hidden_size, VisualConfig.audio_feat_dim)
+
+
+    def forward(self, hidden_states):
+        hidden_states = self.dense(hidden_states)
+        hidden_states = self.transform_act_fn(hidden_states)
+        hidden_states = self.LayerNorm(hidden_states)
+        output_audio_feats = self.decoder(hidden_states)
+        return output_audio_feats
 
 class MMBERTModel(nn.Module):
     """LXRT Model."""
@@ -901,8 +979,9 @@ class MMBERTModel(nn.Module):
         # Run LXRT backbone
         lang_feats, visn_feats, audio_feats = self.encoder(
             input_ids,attention_mask,token_type_ids,
-            visn_feats, visn_attention_mask,
-            audio_feats, audio_attention_mask)
+            visn_feats, extended_visual_attention_mask,
+            audio_feats, extended_audio_attention_mask)
+
         pooled_output = self.pooler(lang_feats)
 
         return (lang_feats, visn_feats, audio_feats), pooled_output
@@ -914,8 +993,9 @@ class MMBERTPretraining(nn.Module):
                  task_mask_lm=True,
                  task_mask_v=True,
                  task_mask_a=True,
+                 matching_task=True,
                  matching_visual=True,
-                 matching_audio=True
+                 matching_audio=True,
                  ):
         super().__init__()
         # Configuration
@@ -925,7 +1005,8 @@ class MMBERTPretraining(nn.Module):
         self.task_mask_lm = task_mask_lm
         self.task_mask_v = task_mask_v
         self.task_mask_a = task_mask_a
-
+        
+        self.matching = matching_task
         self.matching_visual = matching_visual
         self.matching_audio = matching_audio
 
@@ -933,7 +1014,15 @@ class MMBERTPretraining(nn.Module):
         self.bert = MMBERTModel(config)
 
         # Pre-training heads
-        self.cls = BertPreTrainingHeads(self.bert.encoder.cross_config, self.bert.encoder.bertmodel.embeddings.word_embeddings.weight)
+        if self.task_mask_lm or self.matching or self.matching_visual or self.matching_audio:
+            self.cls = BertPreTrainingHeads(self.bert.encoder.cross_config, self.bert.encoder.bertmodel.embeddings.word_embeddings.weight)
+        if self.task_mask_v:
+            self.visual_head = BertVisualObjHead(self.bert.encoder.cross_config)
+        if self.task_mask_a:
+            self.audio_head = BertAudioObjHead(self.bert.encoder.cross_config)
+
+        # BaryCenter
+        ### TODO ###
 
         # Weight initialization
         self.apply(self.init_bert_weights)
@@ -951,35 +1040,221 @@ class MMBERTPretraining(nn.Module):
         if isinstance(module, nn.Linear) and module.bias is not None:
             module.bias.data.zero_()
 
-    def forward(self, input_ids, token_type_ids=None, attention_mask=None,
-                visn_feats=None, visn_attention_mask=None,
-                audio_feats=None, audio_attention_mask=None):
-        (lang_feats, visn_feats, audio_feats), pooled_output = self.bert(
-            input_ids, token_type_ids, attention_mask,
-            visn_feats, visn_attention_mask,
-            audio_feats, audio_attention_mask,
-        )
-        print("lang_feats,pooled_output")
-        print(lang_feats.shape,pooled_output.shape)
-
-        lang_prediction_scores, cross_relationship_score = self.cls(lang_feats, pooled_output)
-        # if self.task_qa:
-        #     answer_score = self.answer_head(pooled_output)
-        # else:
-        #     # This answer_score would not be used anywhere,
-        #     # just to keep a constant return function signature.
-        #     answer_score = pooled_output[0][0]
-
-        # total_loss = 0.
-        # loss_fct = CrossEntropyLoss(ignore_index=-1)
-        # losses = ()
-        # if masked_lm_labels is not None and self.task_mask_lm:
-        #     masked_lm_loss = loss_fct(
-        #         lang_prediction_scores.view(-1, self.config.vocab_size),
-        #         masked_lm_labels.view(-1)
-        #     )
-        #     total_loss += masked_lm_loss
-        #     losses += (masked_lm_loss.detach(),)
+    def forward(self, batch):
+        total_loss = 0.
+        losses = ()
         
-        # return total_loss, torch.stack(losses).unsqueeze(0), answer_score.detach()
-        return (lang_feats, visn_feats, audio_feats), (lang_prediction_scores, cross_relationship_score)
+        if self.task_mask_lm:
+            masked_input_ids = batch.batch_masked_input_ids
+            attention_mask = batch.batch_attention_mask
+            token_type_ids = batch.batch_token_type_ids
+            masked_label = batch.batch_masked_label
+            
+            visual_feat = batch.batch_visual_feat
+            visual_feat_am = batch.batch_visual_feat_am
+            
+            audio_feat = batch.batch_audio_feat
+            audio_feat_am = batch.batch_audio_feat_am
+            
+            (lang_feats, _, _), _ = self.bert(
+                masked_input_ids, token_type_ids, attention_mask,
+                visual_feat, visual_feat_am,
+                audio_feat, audio_feat_am,
+            )
+            lang_prediction_scores, _ = self.cls(lang_feats, None)
+            
+            loss_fct = CrossEntropyLoss(ignore_index=-100)
+            masked_lm_loss = loss_fct(
+                lang_prediction_scores.view(-1, self.config.vocab_size),
+                masked_label.view(-1)
+            )
+            
+            total_loss += masked_lm_loss
+            wandb.log({
+                    "step_task_mask_lm_loss":masked_lm_loss
+                })
+            #losses["task_mask_lm"] = masked_lm_loss.detach()
+            losses += (masked_lm_loss.detach(),)
+            
+        if self.task_mask_v:
+            input_ids = batch.batch_input_ids
+            attention_mask = batch.batch_attention_mask
+            token_type_ids = batch.batch_token_type_ids
+            
+            visual_feat = batch.batch_masked_visual
+            visual_feat_am = batch.batch_visual_feat_am
+            label_visual_feat = batch.batch_masked_visual_label
+            raw_visual_feat = batch.batch_visual_feat
+            
+            audio_feat = batch.batch_audio_feat
+            audio_feat_am = batch.batch_audio_feat_am
+            
+            (_, visual_feat, _), _ = self.bert(
+                input_ids, token_type_ids, attention_mask,
+                visual_feat, visual_feat_am,
+                audio_feat, audio_feat_am,
+            )
+           
+            loss_fct = SmoothL1Loss(reduction='none')
+            
+            visn_prediction_scores = self.visual_head(visual_feat)
+            output_dim = VisualConfig.visual_feat_dim
+            
+            visn_loss = loss_fct(
+                visn_prediction_scores.view(-1, output_dim),
+                raw_visual_feat.view(-1, output_dim)
+            )
+            if visn_loss.dim() > 1:     # Regression Losses
+                visn_loss = visn_loss.mean(1)
+            visn_loss = (visn_loss * label_visual_feat.view(-1)).mean()
+            
+            total_loss += visn_loss
+            wandb.log({
+                    "step_task_mask_v_loss":visn_loss
+                })
+            #losses["task_mask_v"] = visn_loss.detach()
+            losses += (visn_loss.detach(),)
+        
+        if self.task_mask_a:
+            input_ids = batch.batch_input_ids
+            attention_mask = batch.batch_attention_mask
+            token_type_ids = batch.batch_token_type_ids
+
+            visual_feat = batch.batch_visual_feat
+            visual_feat_am = batch.batch_visual_feat_am
+            
+            audio_feat = batch.batch_masked_audio
+            audio_feat_am = batch.batch_audio_feat_am
+            label_audio_feat = batch.batch_masked_audio_label
+            raw_audio_feat = batch.batch_audio_feat
+            
+            (_, _, audio_feat), _ = self.bert(
+                input_ids, token_type_ids, attention_mask,
+                visual_feat, visual_feat_am,
+                audio_feat, audio_feat_am,
+            )
+           
+            loss_fct = SmoothL1Loss(reduction='none')
+            
+            aud_prediction_scores = self.audio_head(audio_feat)
+            output_dim = VisualConfig.audio_feat_dim
+            
+            
+            aud_loss = loss_fct(
+                aud_prediction_scores.view(-1, output_dim),
+                raw_audio_feat.view(-1, output_dim)
+            )
+            if aud_loss.dim() > 1:     # Regression Losses
+                aud_loss = aud_loss.mean(1)
+            aud_loss = (aud_loss * label_audio_feat.view(-1)).mean()
+            
+            total_loss += aud_loss
+            wandb.log({
+                    "step_task_mask_a_loss":aud_loss
+                })
+            #losses["task_mask_a"] = aud_loss.detach()
+            losses += (aud_loss.detach(),)
+        
+        if self.matching:
+            input_ids = batch.batch_input_ids
+            attention_mask = batch.batch_attention_mask
+            token_type_ids = batch.batch_token_type_ids
+
+            visual_feat = batch.batch_visual_feat
+            visual_feat_am = batch.batch_visual_feat_am
+            
+            audio_feat = batch.batch_audio_feat
+            audio_feat_am = batch.batch_audio_feat_am
+            
+            (_, _, _), pooled_output = self.bert(
+                input_ids, token_type_ids, attention_mask,
+                visual_feat, visual_feat_am,
+                audio_feat, audio_feat_am,
+            )
+            _, cross_relationship_score = self.cls(None, pooled_output)
+            loss_fct = CrossEntropyLoss(ignore_index=-1)
+
+            matched_label = torch.ones((cross_relationship_score.shape[0]), dtype=torch.int64).to(cross_relationship_score.device)
+            
+            matched_loss = loss_fct(
+                cross_relationship_score.view(-1, 2),
+                matched_label.view(-1)
+            )
+            total_loss += matched_loss
+            wandb.log({
+                    "step_matching_loss":matched_loss
+                })
+            #losses["matching"] = matched_loss.detach()
+            losses += (matched_loss.detach(),)
+        
+        if self.matching_visual:
+            input_ids = batch.batch_input_ids
+            attention_mask = batch.batch_attention_mask
+            token_type_ids = batch.batch_token_type_ids
+
+            visual_feat = batch.batch_negative_visual
+            visual_feat_am = batch.batch_negativae_visual_am
+            
+            audio_feat = batch.batch_audio_feat
+            audio_feat_am = batch.batch_audio_feat_am
+            
+            (_, _, _), pooled_output = self.bert(
+                input_ids, token_type_ids, attention_mask,
+                visual_feat, visual_feat_am,
+                audio_feat, audio_feat_am,
+            )
+            _, cross_relationship_score = self.cls(None, pooled_output)
+            
+            loss_fct = CrossEntropyLoss(ignore_index=-1)
+
+            matched_label = torch.zeros((cross_relationship_score.shape[0]), dtype=torch.int64).to(cross_relationship_score.device)
+            
+            matched_loss = loss_fct(
+                cross_relationship_score.view(-1, 2),
+                matched_label.view(-1)
+            )
+            total_loss += matched_loss
+            wandb.log({
+                    "step_matching_visual_loss":matched_loss
+                })
+            #losses["matching_visual"] = matched_loss.detach()
+            losses += (matched_loss.detach(),)
+        
+        if self.matching_audio:
+            input_ids = batch.batch_input_ids
+            attention_mask = batch.batch_attention_mask
+            token_type_ids = batch.batch_token_type_ids
+
+            visual_feat = batch.batch_visual_feat
+            visual_feat_am = batch.batch_visual_feat_am
+            
+            audio_feat = batch.batch_negative_audio
+            audio_feat_am = batch.batch_negativae_audio_am
+            
+            (_, _, _), pooled_output = self.bert(
+                input_ids, token_type_ids, attention_mask,
+                visual_feat, visual_feat_am,
+                audio_feat, audio_feat_am,
+            )
+            _, cross_relationship_score = self.cls(None, pooled_output)
+            
+            loss_fct = CrossEntropyLoss(ignore_index=-1)
+
+            matched_label = torch.zeros((cross_relationship_score.shape[0]), dtype=torch.int64).to(cross_relationship_score.device)
+            
+            matched_loss = loss_fct(
+                cross_relationship_score.view(-1, 2),
+                matched_label.view(-1)
+            )
+            total_loss += matched_loss
+            wandb.log({
+                    "step_matching_audio_loss":matched_loss
+                })
+            #losses["matching_audio"] = matched_loss.detach()
+            losses += (matched_loss.detach(),)
+        
+        #return (lang_feats, visn_feats, audio_feats), (lang_prediction_scores, cross_relationship_score)
+        wandb.log({
+                    "step_loss":total_loss
+                })
+        return total_loss, torch.tensor(losses)
