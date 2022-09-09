@@ -73,6 +73,7 @@ def parse_args():
     parser.add_argument('--epochs', type=int, default=10)
     parser.add_argument('--dropout', type=float, default=0.1)
     parser.add_argument('--seed', type=int, default=1606, help='random seed')
+    parser.add_argument("--accum_iter", type=int, default=-1) 
     
     parser.add_argument("--vlayers", default=3, type=int, help='Number of visual layers')
     parser.add_argument("--alayers", default=3, type=int, help='Number of audio layers.')
